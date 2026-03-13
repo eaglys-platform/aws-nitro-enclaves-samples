@@ -1,0 +1,10 @@
+*.code-workspace
+node_modules
+workshop/public
+public
+packaged.yaml
+resources/_gen
+.DS_Store
+enclave_client
+resources/code/my-first-enclave/**/*.eif
+resources/code/my-first-enclave/**/target/
