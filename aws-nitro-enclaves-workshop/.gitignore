@@ -6,5 +6,6 @@ packaged.yaml
 resources/_gen
 .DS_Store
 enclave_client
-resources/code/my-first-enclave/**/*.eif
-resources/code/my-first-enclave/**/target/
+*.eif
+target/
+resources/code/my-first-enclave/cryptographic-attestation/key_policy.json
