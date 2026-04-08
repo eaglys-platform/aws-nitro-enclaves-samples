@@ -77,7 +77,7 @@ def main():
         if plaintext.startswith("KMS Error. Decryption Failed."):
             r["error"] = plaintext
         else:
-            last_four = plaintext
+            last_four = plaintext[-4:]
             r["last_four"] = last_four
 
         c.send(str.encode(json.dumps(r)))

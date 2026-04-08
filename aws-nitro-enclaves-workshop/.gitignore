@@ -8,4 +8,4 @@ resources/_gen
 enclave_client
 *.eif
 target/
-resources/code/my-first-enclave/cryptographic-attestation/key_policy.json
+*key_policy.json
