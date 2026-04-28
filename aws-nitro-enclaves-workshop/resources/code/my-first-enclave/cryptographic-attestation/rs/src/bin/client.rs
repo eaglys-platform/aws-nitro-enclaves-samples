@@ -2,9 +2,9 @@ use aws_config::BehaviorVersion;
 use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_kms::primitives::Blob;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use clap::{ArgGroup, Parser};
+use clap::{Parser, Subcommand};
 use rand::prelude::IndexedRandom;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::Command;
@@ -13,35 +13,32 @@ use vsock::{VsockAddr, VsockStream};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(true)
-        .args(["prepare", "submit"])
-))]
 struct Args {
     #[arg(long, help = "valid KMS key alias")]
     alias: String,
 
-    #[arg(
-        long,
-        help = "The account values file to select an account number from"
-    )]
-    values: Option<String>,
+    #[command(subcommand)]
+    mode: Mode,
+}
 
-    #[arg(
-        long,
-        help = "A file containing a kms-encrypted base64 encoded account number"
-    )]
-    ciphertext: Option<String>,
-
-    #[arg(long, help = "select a single account number and encrypt it using KMS")]
-    prepare: bool,
-
-    #[arg(
-        long,
-        help = "submit an encrypted account number to the enclave server application"
-    )]
-    submit: bool,
+#[derive(Subcommand, Debug)]
+enum Mode {
+    /// select a single account number and encrypt it using KMS
+    Prepare {
+        #[arg(
+            long,
+            help = "The account values file to select an account number from"
+        )]
+        values: Option<String>,
+    },
+    /// submit an encrypted account number to the enclave server application
+    Submit {
+        #[arg(
+            long,
+            help = "A file containing a kms-encrypted base64 encoded account number"
+        )]
+        ciphertext: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +64,16 @@ struct CredentialPayload {
     token: String,
     region: String,
     ciphertext: String,
+}
+
+#[derive(Deserialize)]
+struct ImdsCredentials {
+    #[serde(rename = "AccessKeyId")]
+    access_key_id: String,
+    #[serde(rename = "SecretAccessKey")]
+    secret_access_key: String,
+    #[serde(rename = "Token")]
+    token: String,
 }
 
 fn get_imds_token() -> Option<String> {
@@ -116,35 +123,19 @@ fn get_region() -> Result<String, AppError> {
 
 fn get_credentials(region: &str, ciphertext: &str) -> Result<CredentialPayload, AppError> {
     let role_name = get_imds_text("/latest/meta-data/iam/security-credentials/")?;
-    let creds = get_imds_json(&format!(
+    let creds_text = get_imds_text(&format!(
         "/latest/meta-data/iam/security-credentials/{}",
         role_name
     ))?;
 
     println!("{}", ciphertext);
 
-    let access_key_id = creds
-        .get("AccessKeyId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Misc("Missing AccessKeyId".into()))?
-        .to_string();
-
-    let secret_access_key = creds
-        .get("SecretAccessKey")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Misc("Missing SecretAccessKey".into()))?
-        .to_string();
-
-    let token = creds
-        .get("Token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Misc("Missing Token".into()))?
-        .to_string();
+    let creds: ImdsCredentials = serde_json::from_str(&creds_text)?;
 
     Ok(CredentialPayload {
-        access_key_id,
-        secret_access_key,
-        token,
+        access_key_id: creds.access_key_id,
+        secret_access_key: creds.secret_access_key,
+        token: creds.token,
         region: region.into(),
         ciphertext: ciphertext.into(),
     })
@@ -153,8 +144,7 @@ fn get_credentials(region: &str, ciphertext: &str) -> Result<CredentialPayload, 
 fn get_cid() -> Result<u32, AppError> {
     let output = Command::new("/bin/nitro-cli")
         .arg("describe-enclaves")
-        .output()
-        .map_err(AppError::Io)?;
+        .output()?;
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     json.as_array()
@@ -177,19 +167,16 @@ fn get_random_value(filepath: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Misc("Values array is empty".into()))
 }
 
-#[tokio::main]
-async fn handle_prepare(args: &Args, _region: &str) -> Result<(), AppError> {
-    let val_path = args
-        .values
-        .as_ref()
-        .ok_or_else(|| AppError::MissingArgument("--values is required for --prepare".into()))?;
+async fn handle_prepare(alias: &str, values: Option<&str>, _region: &str) -> Result<(), AppError> {
+    let val_path = values
+        .ok_or_else(|| AppError::MissingArgument("--values is required for prepare".into()))?;
 
     let rand_val = get_random_value(val_path)?;
 
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let client = KmsClient::new(&config);
 
-    let key_id = format!("alias/{}", args.alias);
+    let key_id = format!("alias/{}", alias);
 
     let resp = client
         .encrypt()
@@ -218,11 +205,13 @@ async fn handle_prepare(args: &Args, _region: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn handle_submit(args: &Args, region: &str) -> Result<(), AppError> {
-    let cipher_path = args
-        .ciphertext
-        .as_ref()
-        .ok_or_else(|| AppError::MissingArgument("--ciphertext is required for --submit".into()))?;
+fn handle_submit(
+    _alias: &str,
+    ciphertext_path: Option<&str>,
+    region: &str,
+) -> Result<(), AppError> {
+    let cipher_path = ciphertext_path
+        .ok_or_else(|| AppError::MissingArgument("--ciphertext is required for submit".into()))?;
 
     let mut f = File::open(cipher_path)?;
     let mut ciphertext = String::new();
@@ -235,7 +224,7 @@ fn handle_submit(args: &Args, region: &str) -> Result<(), AppError> {
     let cid = get_cid()?;
     let port = 5000;
 
-    let mut stream = VsockStream::connect(&VsockAddr::new(cid, port)).map_err(AppError::Io)?;
+    let mut stream = VsockStream::connect(&VsockAddr::new(cid, port))?;
 
     stream.write_all(&payload_bytes)?;
 
@@ -248,15 +237,19 @@ fn handle_submit(args: &Args, region: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn main() -> Result<(), AppError> {
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
     let args = Args::parse();
 
     let region = get_region()?;
 
-    if args.prepare {
-        handle_prepare(&args, &region)?;
-    } else if args.submit {
-        handle_submit(&args, &region)?;
+    match &args.mode {
+        Mode::Prepare { values } => {
+            handle_prepare(&args.alias, values.as_deref(), &region).await?;
+        }
+        Mode::Submit { ciphertext } => {
+            handle_submit(&args.alias, ciphertext.as_deref(), &region)?;
+        }
     }
 
     Ok(())
