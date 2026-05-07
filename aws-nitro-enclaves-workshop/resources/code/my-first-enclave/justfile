@@ -1,0 +1,38 @@
+default:
+    @just --list
+
+# Enclaveのビルドと起動
+# 使い方: just run <NAME> [debug-mode]
+run name mode="":
+    @echo "--- Building Docker Image: {{name}} ---"
+    docker build "{{invocation_directory()}}" -t {{name}}
+    
+    @echo "--- Building Enclave Image ---"
+    nitro-cli build-enclave --docker-uri {{name}}:latest --output-file {{invocation_directory()}}/{{name}}.eif
+    
+    @EIF_SIZE=$(du -b --block-size=1M "{{invocation_directory()}}/{{name}}.eif" | cut -f 1); \
+    MEM=$((($EIF_SIZE * 4 + 1024 - 1)/1024 * 1024)); \
+    echo "Calculated Memory: $MEM MB"; \
+    if [ "{{mode}}" = "debug-mode" ]; then \
+        echo "Starting in DEBUG MODE..."; \
+        nitro-cli run-enclave --cpu-count 2 --memory $MEM --eif-path {{invocation_directory()}}/{{name}}.eif --debug-mode; \
+        sleep 2; \
+        ID=$(nitro-cli describe-enclaves | jq -r ".[0].EnclaveID"); \
+        if [ "$ID" != "null" ] && [ -n "$ID" ]; then \
+            nitro-cli console --enclave-id $ID; \
+        fi; \
+    else \
+        echo "Starting in PRODUCTION MODE..."; \
+        nitro-cli run-enclave --cpu-count 2 --memory $MEM --eif-path {{invocation_directory()}}/{{name}}.eif; \
+    fi
+
+# Enclaveの停止
+# 使い方: just stop
+stop:
+    @echo "--- Terminating Enclave ---"
+    @ID=$(nitro-cli describe-enclaves | jq -r ".[0].EnclaveID"); \
+    if [ "$ID" != "null" ] && [ -n "$ID" ]; then \
+        nitro-cli terminate-enclave --enclave-id $ID; \
+    else \
+        echo "No running enclave found."; \
+    fi
